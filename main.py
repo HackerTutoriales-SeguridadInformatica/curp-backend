@@ -42,7 +42,7 @@ def crear_driver():
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--window-size=1280,800')
+    options.add_argument('--window-size=1280,900')
     options.add_argument('--disable-popup-blocking')
     options.add_argument('--disable-gpu')
     options.add_argument('--disable-extensions')
@@ -53,13 +53,12 @@ def crear_driver():
     options.add_argument('--no-first-run')
     options.add_argument('--safebrowsing-disable-auto-update')
     options.add_argument('--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter')
-    options.add_argument('--blink-settings=imagesEnabled=true')  # Necesitamos la imagen del CAPTCHA
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
-    options.page_load_strategy = 'eager'  # No esperar a que carguen imágenes/subrecursos
+    # NO usamos page_load_strategy='eager' porque cortaba el CAPTCHA
 
     driver = webdriver.Remote(command_executor=SELENIUM_URL, options=options)
-    driver.set_page_load_timeout(25)
+    driver.set_page_load_timeout(30)
     driver.set_script_timeout(15)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
@@ -88,7 +87,6 @@ def limpiar_sesiones_viejas():
 
 
 def aceptar_alerta(driver, timeout=0.5):
-    """Acepta una alerta si está presente, sin esperar mucho."""
     try:
         WebDriverWait(driver, timeout).until(EC.alert_is_present())
         driver.switch_to.alert.accept()
@@ -114,7 +112,6 @@ async def obtener_captcha(curp: str):
         driver.get(CURP_URL)
         print(f"[TIEMPO] driver.get: {time.time()-t0:.2f}s")
 
-        # Aceptar alerta inicial (si aparece rápido)
         aceptar_alerta(driver, 1)
 
         # Esperar el campo CURP y llenarlo
@@ -129,26 +126,65 @@ async def obtener_captcha(curp: str):
         """, curp)
         print(f"[TIEMPO] llenar CURP: {time.time()-t0:.2f}s")
 
-        # Esperar a que aparezca la imagen del CAPTCHA (esto es lo más importante)
-        img_captcha = WebDriverWait(driver, 8).until(
+        # === ESPERAS PARA QUE EL CAPTCHA ESTÉ COMPLETAMENTE RENDERIZADO ===
+        # 1. Que exista el elemento <img id="capt">
+        img_captcha = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, "capt"))
         )
 
-        # Esperar a que la imagen esté COMPLETAMENTE cargada (naturalWidth > 0)
-        # y que sea visible para hacer screenshot correcto
-        WebDriverWait(driver, 5).until(
+        # 2. Que la imagen esté cargada COMPLETAMENTE
+        WebDriverWait(driver, 8).until(
             lambda d: d.execute_script(
                 "var i = document.getElementById('capt'); "
-                "return i && i.complete && i.naturalWidth > 0;"
+                "return i && i.complete && i.naturalWidth > 0 && i.naturalHeight > 0;"
             )
         )
-        print(f"[TIEMPO] captcha cargado: {time.time()-t0:.2f}s")
 
-        # Aceptar cualquier alerta pendiente antes de screenshot
+        # 3. Que el elemento tenga dimensiones visibles reales
+        WebDriverWait(driver, 8).until(
+            lambda d: d.execute_script(
+                "var i = document.getElementById('capt'); "
+                "if (!i) return false; "
+                "var r = i.getBoundingClientRect(); "
+                "return r.width > 0 && r.height > 0;"
+            )
+        )
+
+        # 4. Scroll hacia el CAPTCHA para que esté 100% visible en el viewport
+        driver.execute_script("""
+            var i = document.getElementById('capt');
+            if (i) {
+                i.scrollIntoView({block: 'center', inline: 'center'});
+            }
+        """)
+
+        # 5. Esperar a que el scroll se asiente y Chrome repinte
+        time.sleep(0.4)
+
+        # 6. Esperar a que no haya animaciones ni transiciones activas
+        WebDriverWait(driver, 4).until(
+            lambda d: d.execute_script("""
+                var i = document.getElementById('capt');
+                if (!i) return false;
+                var s = window.getComputedStyle(i);
+                return parseFloat(s.opacity) >= 0.99 && s.visibility === 'visible' && s.display !== 'none';
+            """)
+        )
+
         aceptar_alerta(driver, 0.3)
+        print(f"[TIEMPO] captcha listo para screenshot: {time.time()-t0:.2f}s")
 
+        # === Screenshot del elemento ===
         img_base64 = img_captcha.screenshot_as_base64
-        print(f"[TIEMPO] screenshot captcha: {time.time()-t0:.2f}s")
+
+        # Validación: si el base64 es muy pequeño, la imagen puede estar cortada
+        if len(img_base64) < 2000:
+            print(f"[ADVERTENCIA] Screenshot del captcha muy pequeño ({len(img_base64)} chars). Reintentando...")
+            driver.execute_script("document.getElementById('capt').scrollIntoView({block:'center'});")
+            time.sleep(0.5)
+            img_base64 = img_captcha.screenshot_as_base64
+
+        print(f"[TIEMPO] screenshot captcha: {time.time()-t0:.2f}s (base64: {len(img_base64)} chars)")
 
         # Capturar la estructura del formulario para replicar el POST después
         form_fields = driver.execute_script("""
@@ -171,7 +207,6 @@ async def obtener_captcha(curp: str):
             }
             return { action: action, method: method, fields: data };
         """)
-        print(f"[TIEMPO] capturar form: {time.time()-t0:.2f}s | TOTAL captcha: {time.time()-t0:.2f}s")
 
         session_id = str(uuid.uuid4())
         with _lock:
@@ -182,6 +217,7 @@ async def obtener_captcha(curp: str):
                 "form_info": form_fields,
             }
 
+        print(f"[TIEMPO] TOTAL captcha: {time.time()-t0:.2f}s")
         return {
             "captcha_img": img_base64,
             "session_id": session_id
@@ -211,10 +247,9 @@ async def descargar_curp(payload: CurpRequest):
 
     t0 = time.time()
     try:
-        # Aceptar alerta inicial si la hay
         aceptar_alerta(driver, 0.3)
 
-        # === 1. Rellenar CAPTCHA (rápido) ===
+        # === 1. Rellenar CAPTCHA ===
         driver.execute_script("""
             var campo = document.getElementsByName('codigo')[0];
             if (campo) {
@@ -224,28 +259,22 @@ async def descargar_curp(payload: CurpRequest):
             }
         """, captcha)
 
-        # === 2. Enviar formulario con enviar2() y esperar cambio de página ===
-        # En lugar de sleep(4), esperamos a que el DOM cambie de forma detectable.
-        # Guardamos una marca en el body antes de enviar.
+        # === 2. Enviar formulario con enviar2() y esperar el botón "Imprimir Formato" ===
         driver.execute_script("document.body.setAttribute('data-pre-envio', '1');")
         driver.execute_script("enviar2();")
         print(f"[TIEMPO] enviar2 ejecutado: {time.time()-t0:.2f}s")
 
-        # Esperar a que aparezca el botón "Imprimir Formato" (señal de que la página cambió)
         try:
             boton_imprimir = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.NAME, "sbmBuscar"))
             )
             print(f"[TIEMPO] botón sbmBuscar detectado: {time.time()-t0:.2f}s")
         except Exception:
-            # Si no aparece, puede ser CAPTCHA incorrecto o alerta
             aceptar_alerta(driver, 0.5)
             boton_imprimir = None
 
-        # Aceptar cualquier alerta posterior
         aceptar_alerta(driver, 0.3)
 
-        # Diagnóstico breve
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text[:500]
             print(f"[DIAGNÓSTICO] Texto tras enviar: {body_text}")
@@ -259,7 +288,7 @@ async def descargar_curp(payload: CurpRequest):
                        "Texto de la página: " + body_text[:300]
             )
 
-        # === 3. Capturar el estado actual del formulario ===
+        # === 3. Capturar el estado actual del formulario (por si el server agregó campos) ===
         form_actual = driver.execute_script("""
             var form = document.curpForma2 || document.forms['curpForma2'] || document.querySelector('form');
             if (!form) return null;
