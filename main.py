@@ -136,7 +136,7 @@ async def obtener_captcha(curp: str):
 async def descargar_curp(payload: CurpRequest):
     limpiar_sesiones_viejas()
     curp = payload.curp.strip().upper()
-    captcha = payload.captcha.strip().upper()
+    captcha = payload.captcha.strip()  # ← CAMBIO: no forzar mayúsculas
 
     if payload.session_id not in sesiones_activas:
         raise HTTPException(status_code=400, detail="La sesión ha expirado. Vuelve a solicitar el CAPTCHA.")
@@ -150,6 +150,7 @@ async def descargar_curp(payload: CurpRequest):
         except:
             pass
 
+        # ✅ Enviar la CURP en mayúsculas y el CAPTCHA tal cual
         driver.execute_script("""
             document.ejemploForma2.strCurp.value = arguments[0];
             document.ejemploForma2.codigo.value = arguments[1];
