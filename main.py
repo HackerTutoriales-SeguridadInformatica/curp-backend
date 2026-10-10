@@ -112,11 +112,35 @@ async def obtener_captcha(curp: str):
         )
         img_base64 = img_captcha.screenshot_as_base64
 
+        # === Capturar TODOS los campos del formulario para replicar el POST después ===
+        form_fields = driver.execute_script("""
+            var form = document.curpForma2 || document.forms['curpForma2'] || document.querySelector('form');
+            if (!form) return null;
+            var data = {};
+            var action = form.action || window.location.href;
+            var method = (form.method || 'POST').toUpperCase();
+            var elements = form.querySelectorAll('input, select, textarea');
+            for (var i = 0; i < elements.length; i++) {
+                var el = elements[i];
+                if (!el.name) continue;
+                if (el.type === 'checkbox' || el.type === 'radio') {
+                    if (el.checked) data[el.name] = el.value;
+                } else if (el.type === 'submit' || el.type === 'button' || el.type === 'image') {
+                    // no incluir
+                } else {
+                    data[el.name] = el.value;
+                }
+            }
+            return { action: action, method: method, fields: data };
+        """)
+        print(f"[DIAGNÓSTICO] Formulario capturado: {form_fields}")
+
         session_id = str(uuid.uuid4())
         sesiones_activas[session_id] = {
             "driver": driver,
             "curp": curp,
-            "created_at": time.time()
+            "created_at": time.time(),
+            "form_info": form_fields,
         }
 
         return {
@@ -144,6 +168,7 @@ async def descargar_curp(payload: CurpRequest):
 
     info = sesiones_activas[payload.session_id]
     driver = info["driver"]
+    form_info = info.get("form_info") or {}
 
     try:
         # Aceptar cualquier alerta pendiente
@@ -152,20 +177,18 @@ async def descargar_curp(payload: CurpRequest):
         except:
             pass
 
-        # === 1. Rellenar el CAPTCHA y enviar ===
+        # === PASO 1: Rellenar el CAPTCHA en el navegador (por si acaso) ===
         driver.execute_script("""
             var campo = document.getElementsByName('codigo')[0];
-            campo.value = arguments[0];
-            campo.dispatchEvent(new Event('input', { bubbles: true }));
+            if (campo) {
+                campo.value = arguments[0];
+                campo.dispatchEvent(new Event('input', { bubbles: true }));
+            }
         """, captcha)
-
         time.sleep(1)
 
-        try:
-            driver.switch_to.alert.accept()
-        except:
-            pass
-
+        # === PASO 2: Enviar el formulario con el CAPTCHA (enviar2) ===
+        print("[DIAGNÓSTICO] Enviando formulario con CAPTCHA (enviar2)...")
         driver.execute_script("enviar2();")
         time.sleep(4)
 
@@ -174,46 +197,48 @@ async def descargar_curp(payload: CurpRequest):
         except:
             pass
 
-        # === 2. Diagnóstico del texto de la página ===
+        # === PASO 3: Diagnóstico del texto de la página ===
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text[:800]
-            print(f"[DIAGNÓSTICO] Texto de la página tras enviar: {body_text}")
+            print(f"[DIAGNÓSTICO] Texto de la página tras enviar CAPTCHA: {body_text}")
         except Exception as e:
             body_text = ""
             print(f"[DIAGNÓSTICO] Error al leer body: {e}")
 
-        # === 3. Buscar el botón "Imprimir Formato" por name="sbmBuscar" ===
-        print("[DIAGNÓSTICO] Buscando botón 'Imprimir Formato' (name='sbmBuscar')...")
+        # === PASO 4: Capturar el estado ACTUAL del formulario (con los campos que puso el servidor) ===
+        form_actual = driver.execute_script("""
+            var form = document.curpForma2 || document.forms['curpForma2'] || document.querySelector('form');
+            if (!form) return null;
+            var data = {};
+            var action = form.action || window.location.href;
+            var method = (form.method || 'POST').toUpperCase();
+            var elements = form.querySelectorAll('input, select, textarea');
+            for (var i = 0; i < elements.length; i++) {
+                var el = elements[i];
+                if (!el.name) continue;
+                if (el.type === 'checkbox' || el.type === 'radio') {
+                    if (el.checked) data[el.name] = el.value;
+                } else if (el.type === 'submit' || el.type === 'button' || el.type === 'image') {
+                    // no incluir botones
+                } else {
+                    data[el.name] = el.value;
+                }
+            }
+            return { action: action, method: method, fields: data };
+        """)
+        print(f"[DIAGNÓSTICO] Formulario actual: {form_actual}")
 
+        # === PASO 5: Detectar el botón "Imprimir Formato" ===
+        print("[DIAGNÓSTICO] Buscando botón 'Imprimir Formato' (name='sbmBuscar')...")
         boton_imprimir = None
         try:
-            boton_imprimir = WebDriverWait(driver, 12).until(
+            boton_imprimir = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.NAME, "sbmBuscar"))
             )
-            print(f"[DIAGNÓSTICO] Botón encontrado -> "
-                  f"name={boton_imprimir.get_attribute('name')}, "
-                  f"value={boton_imprimir.get_attribute('value')}, "
+            print(f"[DIAGNÓSTICO] Botón encontrado -> value={boton_imprimir.get_attribute('value')}, "
                   f"onclick={boton_imprimir.get_attribute('onclick')}")
         except Exception as e:
             print(f"[DIAGNÓSTICO] No se encontró por name='sbmBuscar': {e}")
-            # Fallback por XPATH value
-            try:
-                boton_imprimir = driver.find_element(
-                    By.XPATH,
-                    "//input[@type='button' and contains(@value, 'Imprimir Formato')]"
-                )
-                print(f"[DIAGNÓSTICO] Botón encontrado por XPATH value: {boton_imprimir.get_attribute('value')}")
-            except:
-                pass
-            # Fallback por onclick
-            if not boton_imprimir:
-                try:
-                    boton_imprimir = driver.find_element(
-                        By.XPATH, "//input[@onclick='enviar()']"
-                    )
-                    print(f"[DIAGNÓSTICO] Botón encontrado por onclick='enviar()'")
-                except:
-                    pass
 
         if not boton_imprimir:
             raise HTTPException(
@@ -222,125 +247,85 @@ async def descargar_curp(payload: CurpRequest):
                        "Texto de la página: " + body_text[:300]
             )
 
-        # === 4. Hacer clic y detectar nueva ventana ===
-        ventanas_antes = set(driver.window_handles)
-        print(f"[DIAGNÓSTICO] Ventanas antes del clic: {len(ventanas_antes)}")
+        # === PASO 6: En lugar de hacer clic, hacer el POST directamente con requests ===
+        # Necesitamos las cookies de Selenium y los campos del formulario actual
+        cookies_dict = {c['name']: c['value'] for c in driver.get_cookies()}
+        print(f"[DIAGNÓSTICO] Cookies: {list(cookies_dict.keys())}")
 
-        # Click por JavaScript para evitar intercepciones
-        driver.execute_script("arguments[0].click();", boton_imprimir)
+        # El action del formulario (a dónde se hace el POST)
+        action_url = (form_actual or form_info).get("action") or driver.current_url
+        if action_url and not action_url.startswith("http"):
+            action_url = urljoin(driver.current_url, action_url)
+        print(f"[DIAGNÓSTICO] URL de acción del formulario: {action_url}")
 
-        # Esperar a que se abra la nueva ventana o se genere el PDF
-        time.sleep(5)
+        # Campos del formulario
+        fields = dict((form_actual or form_info).get("fields") or {})
+        # Asegurar que el CAPTCHA esté actualizado
+        fields['codigo'] = captcha
+        fields['strCurp'] = curp
 
-        try:
-            driver.switch_to.alert.accept()
-        except:
-            pass
+        # Asegurar que se incluya el botón "Imprimir Formato" para que el servidor
+        # sepa que queremos la impresión (el name es sbmBuscar)
+        fields['sbmBuscar'] = ' Imprimir Formato '
 
-        ventanas_despues = set(driver.window_handles)
-        ventanas_nuevas = ventanas_despues - ventanas_antes
-        print(f"[DIAGNÓSTICO] Ventanas después del clic: {len(ventanas_despues)}, nuevas: {len(ventanas_nuevas)}")
-
-        url_pdf = None
-
-        if ventanas_nuevas:
-            nueva_ventana = list(ventanas_nuevas)[0]
-            driver.switch_to.window(nueva_ventana)
-            time.sleep(2)
-            url_pdf = driver.current_url
-            print(f"[DIAGNÓSTICO] Nueva ventana detectada. URL: {url_pdf}")
-        else:
-            url_pdf = driver.current_url
-            print(f"[DIAGNÓSTICO] Sin nueva ventana. URL actual: {url_pdf}")
-
-        # === 5. Buscar si hay un <embed>, <iframe> u <object> con el PDF ===
-        try:
-            pdf_embed = driver.execute_script("""
-                function buscarPdf(doc, depth) {
-                    if (depth > 3) return null;
-                    try {
-                        var embed = doc.querySelector('embed[type="application/pdf"], embed[src*=".pdf"], embed[src*="pdf"]');
-                        if (embed && embed.src) return { tipo: 'embed', src: embed.src };
-                        var obj = doc.querySelector('object[type="application/pdf"], object[data*=".pdf"]');
-                        if (obj && obj.data) return { tipo: 'object', src: obj.data };
-                        var iframe = doc.querySelector('iframe');
-                        if (iframe) {
-                            if (iframe.src && (iframe.src.toLowerCase().includes('.pdf') || iframe.src.toLowerCase().includes('pdf'))) {
-                                return { tipo: 'iframe', src: iframe.src };
-                            }
-                            try {
-                                var inner = buscarPdf(iframe.contentDocument, depth + 1);
-                                if (inner) return inner;
-                            } catch (e) {}
-                        }
-                    } catch (e) {}
-                    return null;
-                }
-                return buscarPdf(document, 0);
-            """)
-            print(f"[DIAGNÓSTICO] Búsqueda de PDF embebido: {pdf_embed}")
-            if pdf_embed and pdf_embed.get('src'):
-                url_pdf = pdf_embed['src']
-                print(f"[DIAGNÓSTICO] URL del PDF desde {pdf_embed['tipo']}: {url_pdf}")
-        except Exception as e:
-            print(f"[DIAGNÓSTICO] Error buscando PDF embebido: {e}")
-
-        # Si la URL es relativa, construir absoluta
-        if url_pdf and not url_pdf.startswith("http"):
-            url_pdf = urljoin(driver.current_url, url_pdf)
-            print(f"[DIAGNÓSTICO] URL absoluta construida: {url_pdf}")
-
-        print(f"[DIAGNÓSTICO] URL final para descargar: {url_pdf}")
-
-        # === 6. Descargar con cookies de Selenium ===
-        session = requests.Session()
-        for cookie in driver.get_cookies():
-            session.cookies.set(cookie['name'], cookie['value'])
+        print(f"[DIAGNÓSTICO] Campos a enviar: {list(fields.keys())}")
 
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                           '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/pdf,application/octet-stream,*/*',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'es-MX,es;q=0.9,en;q=0.8',
             'Referer': driver.current_url,
+            'Origin': 'https://consultas.curp.gob.mx',
+            'Content-Type': 'application/x-www-form-urlencoded',
         }
 
-        contenido = b""
-        content_type = ""
-        es_pdf = False
+        # Hacer el POST con requests
+        print("[DIAGNÓSTICO] Haciendo POST con requests...")
+        session = requests.Session()
+        for k, v in cookies_dict.items():
+            session.cookies.set(k, v)
 
-        try:
-            pdf_response = session.get(url_pdf, headers=headers, timeout=30, allow_redirects=True)
-            print(f"[DIAGNÓSTICO] GET final URL: {pdf_response.url}")
-            print(f"[DIAGNÓSTICO] Status: {pdf_response.status_code}")
-            print(f"[DIAGNÓSTICO] Content-Type: {pdf_response.headers.get('Content-Type', '')}")
-            contenido = pdf_response.content
-            content_type = pdf_response.headers.get('Content-Type', '')
-            es_pdf = contenido[:4] == b'%PDF'
-            print(f"[DIAGNÓSTICO] Es PDF válido: {es_pdf} | Tamaño: {len(contenido)} bytes")
-            print(f"[DIAGNÓSTICO] Primeros 300 bytes: {contenido[:300]}")
-        except Exception as e:
-            print(f"[DIAGNÓSTICO] Error en requests.get: {e}")
+        resp = session.post(action_url, data=fields, headers=headers, timeout=30, allow_redirects=True)
+        print(f"[DIAGNÓSTICO] POST status: {resp.status_code}")
+        print(f"[DIAGNÓSTICO] POST final URL: {resp.url}")
+        print(f"[DIAGNÓSTICO] POST Content-Type: {resp.headers.get('Content-Type', '')}")
 
-        # === 7. Si no es PDF, último intento: usar el navegador para obtener el contenido ===
+        contenido = resp.content
+        content_type = resp.headers.get('Content-Type', '')
+        es_pdf = contenido[:4] == b'%PDF'
+
+        print(f"[DIAGNÓSTICO] Es PDF: {es_pdf} | Tamaño: {len(contenido)} bytes")
+        print(f"[DIAGNÓSTICO] Primeros 300 bytes: {contenido[:300]}")
+
+        # === PASO 7: Si no es PDF, intentar con el navegador (por si el servidor abrió algo en otra ventana) ===
         if not es_pdf:
-            print("[DIAGNÓSTICO] No es PDF con requests. Intentando con Selenium...")
+            print("[DIAGNÓSTICO] No es PDF con POST. Revisando si el navegador tiene algo...")
+            # Buscar en el navegador algún <embed>/<iframe> con el PDF
             try:
-                # Si la URL termina en .pdf o similar, traer el blob vía JS
-                pdf_base64 = driver.execute_script("""
-                    try {
-                        // Buscar en <embed> el contenido
-                        var embed = document.querySelector('embed[type="application/pdf"]');
-                        if (embed) return embed.src;
-                        var iframe = document.querySelector('iframe');
-                        if (iframe) return iframe.src;
-                    } catch(e) { return null; }
+                pdf_url = driver.execute_script("""
+                    var embed = document.querySelector('embed[type="application/pdf"], embed[src*=".pdf"]');
+                    if (embed && embed.src) return embed.src;
+                    var obj = document.querySelector('object[type="application/pdf"]');
+                    if (obj && obj.data) return obj.data;
+                    var iframe = document.querySelector('iframe');
+                    if (iframe && iframe.src) return iframe.src;
                     return null;
                 """)
-                print(f"[DIAGNÓSTICO] URL embebida en el navegador: {pdf_base64}")
+                if pdf_url:
+                    if not pdf_url.startswith("http"):
+                        pdf_url = urljoin(driver.current_url, pdf_url)
+                    print(f"[DIAGNÓSTICO] PDF embebido en navegador: {pdf_url}")
+                    resp2 = session.get(pdf_url, headers=headers, timeout=30)
+                    if resp2.content[:4] == b'%PDF':
+                        contenido = resp2.content
+                        content_type = resp2.headers.get('Content-Type', '')
+                        es_pdf = True
+                        print(f"[DIAGNÓSTICO] ¡PDF obtenido desde embebido! Tamaño: {len(contenido)}")
             except Exception as e:
-                print(f"[DIAGNÓSTICO] Error intentando Selenium: {e}")
+                print(f"[DIAGNÓSTICO] Error buscando PDF en navegador: {e}")
 
-        # === 8. Cerrar sesión ===
+        # === PASO 8: Cerrar sesión ===
         try:
             driver.quit()
         except:
