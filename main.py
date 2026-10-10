@@ -9,11 +9,9 @@ import requests
 import os
 import time
 import uuid
-import base64
 
 app = FastAPI()
 
-# ✅ Permitir CORS para que tu panel en Vercel pueda llamar al backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,9 +23,8 @@ app.add_middleware(
 SELENIUM_URL = os.getenv("SELENIUM_URL", "http://localhost:4444")
 CURP_URL = "https://consultas.curp.gob.mx/CurpSP/consulinterCurSP.do"
 
-# ✅ Sesiones activas: {session_id: {"driver": ..., "created_at": timestamp}}
 sesiones_activas = {}
-TIMEOUT_SESION_SEGUNDOS = 300  # 5 minutos máximo por sesión
+TIMEOUT_SESION_SEGUNDOS = 300
 
 class CurpRequest(BaseModel):
     curp: str
@@ -46,7 +43,6 @@ def crear_driver():
     options.add_experimental_option('useAutomationExtension', False)
     driver = webdriver.Remote(command_executor=SELENIUM_URL, options=options)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    # Bloquear alerts
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": """
             window.alert = function(){ return true; };
@@ -57,72 +53,63 @@ def crear_driver():
     return driver
 
 def limpiar_sesiones_viejas():
-    """Cierra drivers que llevan más de TIMEOUT_SESION_SEGUNDOS."""
     ahora = time.time()
-    sessiones_a_borrar = []
+    sesiones_a_borrar = []
     for sid, info in sesiones_activas.items():
         if ahora - info["created_at"] > TIMEOUT_SESION_SEGUNDOS:
             try:
                 info["driver"].quit()
             except:
                 pass
-            sessiones_a_borrar.append(sid)
-    for sid in sessiones_a_borrar:
+            sesiones_a_borrar.append(sid)
+    for sid in sesiones_a_borrar:
         del sesiones_activas[sid]
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "mensaje": "Backend de CURP funcionando", "sesiones_activas": len(sesiones_activas)}
+    return {"status": "ok", "sesiones_activas": len(sesiones_activas)}
 
 @app.get("/captcha")
 async def obtener_captcha(curp: str):
-    """
-    Abre el portal, ingresa la CURP, guarda la sesión de Selenium en memoria
-    y devuelve la imagen del captcha + el session_id.
-    """
     limpiar_sesiones_viejas()
-
+    curp = curp.strip().upper()
+    
     driver = None
     try:
         driver = crear_driver()
         driver.get(CURP_URL)
         time.sleep(3)
 
-        # Cerrar alertas si hay
         try:
             driver.switch_to.alert.accept()
         except:
             pass
 
-        # Llenar la CURP vía JavaScript (evita onkeypress)
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.NAME, "strCurp"))
         )
-        driver.execute_script(f"""
+        driver.execute_script("""
             var campo = document.getElementsByName('strCurp')[0];
-            campo.value = '{curp.upper()}';
-            campo.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        """)
+            campo.value = arguments[0];
+            campo.dispatchEvent(new Event('input', { bubbles: true }));
+        """, curp)
 
         time.sleep(2)
 
-        # Cerrar alertas de nuevo
         try:
             driver.switch_to.alert.accept()
         except:
             pass
 
-        # Tomar screenshot del captcha
         img_captcha = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, "capt"))
         )
         img_base64 = img_captcha.screenshot_as_base64
 
-        # ✅ GUARDAR la sesión para reutilizarla en /descargar-curp
         session_id = str(uuid.uuid4())
         sesiones_activas[session_id] = {
             "driver": driver,
-            "curp": curp.upper(),
+            "curp": curp,
             "created_at": time.time()
         }
 
@@ -141,11 +128,9 @@ async def obtener_captcha(curp: str):
 
 @app.post("/descargar-curp")
 async def descargar_curp(payload: CurpRequest):
-    """
-    Recibe la CURP, el captcha resuelto y el session_id.
-    Reutiliza el driver guardado para enviar el formulario y descargar el PDF.
-    """
     limpiar_sesiones_viejas()
+    curp = payload.curp.strip().upper()
+    captcha = payload.captcha.strip().upper()
 
     if payload.session_id not in sesiones_activas:
         raise HTTPException(status_code=400, detail="La sesión ha expirado. Vuelve a solicitar el CAPTCHA.")
@@ -154,91 +139,128 @@ async def descargar_curp(payload: CurpRequest):
     driver = info["driver"]
 
     try:
-        # Cerrar alertas si hay
         try:
             driver.switch_to.alert.accept()
         except:
             pass
 
-        # Llenar el captcha vía JavaScript
-        driver.execute_script(f"""
+        driver.execute_script("""
             var campo = document.getElementsByName('codigo')[0];
-            campo.value = '{payload.captcha.upper()}';
-            campo.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        """)
+            campo.value = arguments[0];
+            campo.dispatchEvent(new Event('input', { bubbles: true }));
+        """, captcha)
 
         time.sleep(1)
 
-        # Cerrar alertas
         try:
             driver.switch_to.alert.accept()
         except:
             pass
 
-        # Hacer clic en el botón Buscar via enviar2()
         driver.execute_script("enviar2();")
-
         time.sleep(4)
 
-        # Cerrar alertas
         try:
             driver.switch_to.alert.accept()
         except:
             pass
 
-        # Verificar si la página de resultados cargó
-        # Buscar enlaces o botones de descarga del PDF
-        enlaces_pdf = driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf') or contains(@onclick, 'pdf') or contains(@onclick, 'PDF') or contains(@href, 'imprimir') or contains(@href, 'Imprimir')]")
+        # === DIAGNÓSTICO: ver qué hay en la página actual ===
+        try:
+            body_text = driver.find_element(By.TAG_NAME, "body").text[:500]
+            print(f"[DIAGNÓSTICO] Texto de la página tras enviar: {body_text}")
+        except Exception as e:
+            print(f"[DIAGNÓSTICO] Error al leer body: {e}")
 
-        if not enlaces_pdf:
-            enlaces_pdf = driver.find_elements(By.XPATH, "//input[contains(@value, 'Imprimir') or contains(@value, 'Descargar') or contains(@value, 'Constancia')] | //button[contains(text(), 'Imprimir') or contains(text(), 'Descargar') or contains(text(), 'Constancia')]")
+        # === Buscar enlaces candidatos a PDF ===
+        print("[DIAGNÓSTICO] Buscando enlaces candidatos a PDF...")
+        enlaces_candidatos = driver.find_elements(By.XPATH,
+            "//a[contains(@href, '.pdf') or contains(@href, 'pdf') "
+            "or contains(@href, 'Imprimir') or contains(@href, 'imprimir') "
+            "or contains(@href, 'Constancia') or contains(@href, 'constancia') "
+            "or contains(@onclick, 'pdf') or contains(@onclick, 'PDF') "
+            "or contains(@onclick, 'imprimir') or contains(@onclick, 'Imprimir')]"
+        )
 
-        if not enlaces_pdf:
-            # Verificar si hay mensaje de error en la página
+        print(f"[DIAGNÓSTICO] Enlaces encontrados: {len(enlaces_candidatos)}")
+        for i, enlace in enumerate(enlaces_candidatos):
             try:
-                body_text = driver.find_element(By.TAG_NAME, "body").text
-                if "incorrecto" in body_text.lower() or "inválido" in body_text.lower() or "error" in body_text.lower():
-                    raise HTTPException(status_code=400, detail="CURP o CAPTCHA incorrecto. Intenta de nuevo.")
-            except HTTPException:
-                raise
+                print(f"  [{i}] texto='{enlace.text}' href='{enlace.get_attribute('href')}' onclick='{enlace.get_attribute('onclick')}'")
             except:
                 pass
-            raise Exception("No se encontró el botón para descargar el PDF. Verifica el CAPTCHA e intenta de nuevo.")
 
-        url_pdf = enlaces_pdf[0].get_attribute('href')
+        if not enlaces_candidatos:
+            raise HTTPException(
+                status_code=400,
+                detail="No se encontró ningún enlace de descarga. Verifica que el CAPTCHA sea correcto. Texto de la página: " + body_text[:300]
+            )
 
-        # Si no tiene href, hacer clic y buscar el enlace resultante
+        # Tomar el primer enlace con href
+        url_pdf = None
+        for enlace in enlaces_candidatos:
+            href = enlace.get_attribute('href')
+            if href and href != "javascript:void(0)" and not href.startswith("javascript:"):
+                url_pdf = href
+                break
+
         if not url_pdf:
-            enlaces_pdf[0].click()
+            # Intentar hacer clic y ver si abre una nueva ventana
+            ventana_original = driver.current_window_handle
+            enlaces_candidatos[0].click()
             time.sleep(3)
-            url_pdf = driver.current_url
+            ventanas = driver.window_handles
+            if len(ventanas) > 1:
+                # Cambiar a la nueva ventana
+                driver.switch_to.window(ventanas[-1])
+                url_pdf = driver.current_url
+                print(f"[DIAGNÓSTICO] URL de nueva ventana: {url_pdf}")
+            else:
+                url_pdf = driver.current_url
+                print(f"[DIAGNÓSTICO] URL actual tras clic: {url_pdf}")
 
-        # Descargar el PDF usando las cookies de la sesión
+        print(f"[DIAGNÓSTICO] URL final del PDF: {url_pdf}")
+
+        # Descargar con cookies de la sesión
         session = requests.Session()
         for cookie in driver.get_cookies():
             session.cookies.set(cookie['name'], cookie['value'])
 
-        pdf_response = session.get(url_pdf)
+        pdf_response = session.get(url_pdf, timeout=30)
         pdf_response.raise_for_status()
 
-        # ✅ Cerrar la sesión después de usarla
+        contenido = pdf_response.content
+        content_type = pdf_response.headers.get('Content-Type', '')
+
+        es_pdf = contenido[:4] == b'%PDF'
+        
+        print(f"[DIAGNÓSTICO] Content-Type: {content_type}")
+        print(f"[DIAGNÓSTICO] Es PDF válido: {es_pdf}")
+        print(f"[DIAGNÓSTICO] Tamaño: {len(contenido)} bytes")
+        print(f"[DIAGNÓSTICO] Primeros 300 bytes: {contenido[:300]}")
+
+        # Cerrar sesión
         try:
             driver.quit()
         except:
             pass
         del sesiones_activas[payload.session_id]
 
+        if not es_pdf:
+            texto_recibido = contenido.decode('utf-8', errors='replace')[:500]
+            raise HTTPException(
+                status_code=500,
+                detail=f"El archivo descargado NO es un PDF (Content-Type: {content_type}). Primeros 500 caracteres: {texto_recibido}"
+            )
+
         return Response(
-            content=pdf_response.content,
+            content=contenido,
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=CURP_{payload.curp}.pdf"}
+            headers={"Content-Disposition": f"attachment; filename=CURP_{curp}.pdf"}
         )
 
     except HTTPException:
-        # Re-lanzar HTTPExceptions sin cerrar el driver (para que el usuario reintente con otro captcha)
         raise
     except Exception as e:
-        # Cerrar driver en caso de error fatal
         try:
             driver.quit()
         except:
