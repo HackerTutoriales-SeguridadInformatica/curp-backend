@@ -408,3 +408,4 @@ async def descargar_curp(payload: CurpRequest):
             if payload.session_id in sesiones_activas:
                 del sesiones_activas[payload.session_id]
         raise HTTPException(status_code=500, detail=f"Error al descargar CURP: {str(e)}")
+        
